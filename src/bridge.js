@@ -9735,8 +9735,11 @@ async function main() {
       const cacheKey = `${safeName}:${stateStat.mtimeMs}:${stateStat.size}:${roleStat.mtimeMs}:${roleStat.size}`;
       if (roleHintCache.key === cacheKey) return roleHintCache.raw;
       const raw = fs.readFileSync(roleFile, 'utf8');
-      roleHintCache = { key: cacheKey, raw };
-      return raw;
+      // frontmatter（persona/state）是给桥接读的元数据，不进提示词：
+      // 以前直接注入原文，模型会在角色卡开头看到一段 YAML，白占预算还可能被当成正文。
+      const body = parseRoleCard(raw).body;
+      roleHintCache = { key: cacheKey, raw: body };
+      return body;
     } catch {
       return '';
     }
