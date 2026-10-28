@@ -29,6 +29,20 @@
     "private": [],
     "groups": []
   },
+  "groupAutoAllow": {
+    "inviters": [],
+    "adoptExisting": false
+  },
+  "sharedMemory": {
+    "enabled": true,
+    "includePrivate": false,
+    "injectInPrompt": true,
+    "maxObservations": 800,
+    "maxFacts": 200,
+    "digestLines": 6,
+    "digestMaxChars": 800,
+    "digestWindowMinutes": 45
+  },
   "deny": {
     "private": [],
     "groups": []
@@ -230,7 +244,17 @@
       "defaultVolume": 1,
       "loudness": "normal",
       "ffmpegPath": "",
-      "autoReadback": true
+      "autoReadback": true,
+      "transcribe": {
+        "enabled": false,
+        "python": "",
+        "script": "scripts/asr-transcribe.py",
+        "model": "small",
+        "modelDir": "",
+        "computeType": "int8",
+        "language": "zh",
+        "timeoutMs": 60000
+      }
     },
     "proactive": {
       "enabled": true,

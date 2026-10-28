@@ -25,6 +25,8 @@ import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
 import { normalizeImageForModel } from './media-normalize.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
+import { createSharedMemory } from './shared-memory.js';
+import { transcribeInboundVoice } from './voice-asr.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
 import { resolvePriceTable } from './model-prices.js';
@@ -688,6 +690,22 @@ function loadConfig() {
     },
     // 私聊/群聊均未配置白名单时是否放行所有（true 时启动会打警告）
     allowAllWhenEmpty: file.allowAllWhenEmpty === true,
+    // 入群自动授权：信任的邀请人 + 启动时是否直接纳管「已在但未授权」的群
+    groupAutoAllow: {
+      inviters: normalizeIdList(file.groupAutoAllow?.inviters ?? []),
+      adoptExisting: file.groupAutoAllow?.adoptExisting === true
+    },
+    // 跨会话共享记忆（memory/联想层）的开关与容量
+    sharedMemory: {
+      enabled: file.sharedMemory?.enabled !== false,
+      includePrivate: file.sharedMemory?.includePrivate === true,
+      injectInPrompt: file.sharedMemory?.injectInPrompt !== false,
+      maxObservations: file.sharedMemory?.maxObservations,
+      maxFacts: file.sharedMemory?.maxFacts,
+      digestLines: file.sharedMemory?.digestLines,
+      digestMaxChars: file.sharedMemory?.digestMaxChars,
+      digestWindowMinutes: file.sharedMemory?.digestWindowMinutes
+    },
     ackMessage: file.ackMessage ?? '🤔 收到，正在思考…',
     sendDelayMs: file.sendDelayMs ?? 300,
     questionTimeoutMs: file.questionTimeoutMs ?? 5 * 60 * 1000,
@@ -772,6 +790,7 @@ function loadConfig() {
         setWakeConfig: true,
         markRead: true,
         memory: true,
+        sharedMemory: true,
         getImages: true,
         getForwardMsg: true,
         sendPoke: true,
@@ -895,6 +914,7 @@ function loadConfig() {
     setWakeConfig: true,
     markRead: true,
     memory: true,
+    sharedMemory: true,
     slangQuery: true,
     slangSubmit: true,
     getImages: true,
@@ -1254,7 +1274,15 @@ async function segmentsToText(segments, options = {}) {
       // 市场表情（mface）在部分网关实现里出现：有 summary 就用它，别让模型只看到 "[mface]"。
       case 'mface': out.push(`[表情${d.summary ? `:${d.summary}` : ''}]`); break;
       case 'image': out.push('[图片]'); break;
-      case 'record': out.push('[语音]'); break;
+      case 'record': {
+        // 入站语音：能在本地转成文字就写成「[语音：…]」，否则维持 [语音]（转写失败绝不阻塞消息）。
+        let voiceText = null;
+        if (typeof options.transcribeRecord === 'function') {
+          try { voiceText = await options.transcribeRecord(seg); } catch { voiceText = null; }
+        }
+        out.push(voiceText ? `[语音：${voiceText}]` : '[语音]');
+        break;
+      }
       case 'video': out.push('[视频]'); break;
       case 'file': out.push(`[文件${d.name ?? ''}]`); break;
       case 'reply': {
@@ -1384,6 +1412,8 @@ let stateDirHardened = null;
 // ── 主流程 ──────────────────────────────────────────────────────────────────
 async function main() {
   const cfg = loadConfig();
+  // 跨会话共享记忆（memory/联想层）：state/shared-memory.json，自动扫描 + 模型主动记事实
+  const sharedMemory = createSharedMemory({ file: path.join(STATE_DIR, 'shared-memory.json'), cfg, log });
   fs.mkdirSync(STATE_DIR, { recursive: true });
   hardenStateDirAcl();
   acquireLock();
@@ -2800,6 +2830,134 @@ async function main() {
     saveSocialV2State();
     stopRetiredSessionWork(sessionId, key);
     log(`会话权限已变化，停用旧映射 ${key} -> ${sessionId}`);
+  }
+
+  /**
+   * 处理「机器人自己离开群」的通知：踢出/主动退群/群解散时把群从白名单里摘掉。
+   */
+  async function handleGroupLeaveNotice(event) {
+    const selfId = String(event?.self_id ?? '');
+    if (!selfId || String(event?.user_id ?? '') !== selfId) return;
+    const sub = String(event?.sub_type ?? '');
+    if (!['kick_me', 'leave', 'disband'].includes(sub)) return;
+    const groupId = Number(event?.group_id);
+    if (!Number.isFinite(groupId) || groupId <= 0) return;
+    const current = cfg.allow ?? { private: [], groups: [] };
+    const groups = (current.groups ?? []).map(Number).filter((n) => n !== groupId);
+    if (groups.length === (current.groups ?? []).length) return; // 本来就不在白名单
+    try {
+      const configFile = path.join(ROOT, 'config.json');
+      const file = readConfigObject(configFile);
+      file.allow = { ...(file.allow ?? {}), private: (current.private ?? []).map(Number), groups };
+      atomicWriteJson(configFile, file);
+      cfg.allow = { private: (current.private ?? []).map(Number), groups };
+      reconcileSessionPolicies();
+      log(`退群清理：group:${groupId}（${sub}）已从白名单移除`);
+      appendActivity(`group:${groupId} [allow] 退群清理（${sub}）`);
+    } catch (error) {
+      log(`退群清理失败 group:${groupId}：${error?.message ?? error}`);
+    }
+  }
+
+  /**
+   * 处理「机器人自己被拉进群」的通知：邀请人在信任名单里就自动加白。
+   *
+   * 为什么只认邀请人：白名单是唯一让群聊进入模型视野的闸门，自动化必须收敛到
+   * 一个**人**的决定上（owner 或明确列出的 QQ），而不是「入群即授权」。
+   */
+  async function handleGroupJoinNotice(event) {
+    const selfId = String(event?.self_id ?? '');
+    const joined = String(event?.user_id ?? '');
+    if (!selfId || joined !== selfId) return; // 只关心「我自己入群」，别人进群不处理
+    const groupId = Number(event?.group_id);
+    const inviterId = Number(event?.operator_id);
+    if (!Number.isFinite(groupId) || groupId <= 0) return;
+    const inviters = (cfg.groupAutoAllow?.inviters ?? []).map(Number).filter((n) => Number.isFinite(n));
+    if (inviters.length === 0) {
+      log(`入群通知：group:${groupId}（邀请人 ${inviterId}），groupAutoAllow.inviters 为空，未自动授权`);
+      return;
+    }
+    if (!inviters.includes(inviterId)) {
+      log(`入群通知：group:${groupId}（邀请人 ${inviterId}）不在信任名单内，未自动授权`);
+      return;
+    }
+    const current = cfg.allow ?? { private: [], groups: [] };
+    if ((current.groups ?? []).map(Number).includes(groupId)) {
+      log(`入群通知：group:${groupId} 已在白名单内（邀请人 ${inviterId}），无需改动`);
+      return;
+    }
+    if (saveAllowGroups([...(current.groups ?? []).map(Number), groupId], `入群自动授权 group:${groupId}（邀请人 ${inviterId}）`)) {
+      log(`入群自动授权：group:${groupId} 已加入白名单（邀请人 ${inviterId} 在信任名单内）`);
+    }
+  }
+
+  /** 写白名单的唯一入口：config.json + 内存 + 会话策略三处一起改。 */
+  function saveAllowGroups(groups, note) {
+    const current = cfg.allow ?? { private: [], groups: [] };
+    const nextGroups = [...new Set(groups.map(Number).filter((n) => Number.isFinite(n) && n > 0))];
+    try {
+      const configFile = path.join(ROOT, 'config.json');
+      const file = readConfigObject(configFile);
+      file.allow = { ...(file.allow ?? {}), private: (current.private ?? []).map(Number), groups: nextGroups };
+      atomicWriteJson(configFile, file);
+      cfg.allow = { private: (current.private ?? []).map(Number), groups: nextGroups };
+      reconcileSessionPolicies();
+      log(`白名单已更新（${note}）：群 ${nextGroups.join(',') || '无'}`);
+      appendActivity(`[allow] ${note}：群 ${nextGroups.join(',') || '无'}`);
+      return true;
+    } catch (error) {
+      log(`白名单写入失败（${note}）：${error?.message ?? error}`);
+      return false;
+    }
+  }
+
+  /**
+   * 启动扫描：连上 SnowLuma 后拉一次群列表，找出「我已经在、但白名单里没有」的群。
+   *
+   * 为什么需要它：入群自动授权只在**在线**时收得到 group_increase 事件；桥接停机、
+   * 或功能上线前就已经加入的群，事件永远不会重放 —— 那些群会被静默丢弃消息（实测
+   * 一天丢过 22 条）。这里按 `groupAutoAllow.adoptExisting` 决定"直接纳管"还是
+   * "私聊 owner 报备"，默认报备不纳管。
+   */
+  let groupScanState = 'idle';
+  async function scanUngrantedGroups() {
+    if (groupScanState === 'running') return;
+    groupScanState = 'running';
+    try {
+      const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+      const res = await fetch(`${httpUrl}/get_group_list`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+        },
+        body: '{}',
+        signal: AbortSignal.timeout(15000)
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok || body?.status !== 'ok' || body?.retcode !== 0) {
+        groupScanState = 'idle'; // 连不上：下次重连再试
+        return;
+      }
+      const groups = Array.isArray(body.data) ? body.data : [];
+      const allowed = new Set((cfg.allow?.groups ?? []).map(Number));
+      const missing = groups.filter((g) => Number.isFinite(Number(g?.group_id)) && !allowed.has(Number(g.group_id)));
+      if (missing.length === 0) { groupScanState = 'done'; return; }
+      const label = missing.map((g) => `${g.group_id}（${g.group_name ?? '?'}）`).join('、');
+      log(`启动扫描：发现 ${missing.length} 个未授权群：${label}`);
+      if (cfg.groupAutoAllow?.adoptExisting === true) {
+        saveAllowGroups([...allowed, ...missing.map((g) => Number(g.group_id))], '启动扫描自动纳管');
+      } else if (cfg.ownerQQ) {
+        try {
+          await onebotSend('private', cfg.ownerQQ,
+            `发现 ${missing.length} 个我已经在、但没授权的群：${label}\n这些群的消息现在会被直接丢弃。要监听就加白名单，或把 groupAutoAllow.adoptExisting 设为 true。`, null);
+        } catch { /* 私聊失败不阻断 */ }
+      }
+      groupScanState = 'done';
+    } catch (error) {
+      groupScanState = 'idle';
+      log(`启动扫描群列表失败：${error?.message ?? error}`);
+    }
   }
 
   function reconcileSessionPolicies() {
@@ -4424,7 +4582,7 @@ async function main() {
             merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sharedMemory', 'sendVoice'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -6624,6 +6782,45 @@ async function main() {
           }
           return;
         }
+        // ── 跨会话共享记忆（memory / 联想层）──────────────────────────────────
+        // GET：检索事实 + 别的会话的最近观察；POST：记一条跨会话事实。
+        // agent 通道要令牌 + 模式白名单 + 工具开关；控制台通道由外层 consoleToken 把关。
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/shared-memory') {
+          const key = String(url.searchParams.get('key') ?? '').trim();
+          if (req.headers['x-agent-token']) {
+            if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+            if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+            if (!v2ToolEnabled('sharedMemory')) { sendJson({ ok: false, error: '工具未启用：qq_shared_recall' }, 403); return; }
+          }
+          const found = sharedMemory.recall({
+            query: String(url.searchParams.get('q') ?? ''),
+            limit: Number(url.searchParams.get('limit')) || 8
+          });
+          sendJson({ ok: true, ...found, stats: sharedMemory.stats() });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/shared-memory') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          if (req.headers['x-agent-token']) {
+            if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+            if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+            if (!v2ToolEnabled('sharedMemory')) { sendJson({ ok: false, error: '工具未启用：qq_shared_remember' }, 403); return; }
+          }
+          const text = String(body.text ?? '').trim();
+          if (!text) { sendJson({ ok: false, error: 'text 不能为空' }, 400); return; }
+          const fact = sharedMemory.remember({
+            text,
+            tags: Array.isArray(body.tags) ? body.tags : [],
+            source: key || (body.source ? String(body.source) : null)
+          });
+          if (!fact) { sendJson({ ok: false, error: '共享记忆未启用或内容无效' }, 400); return; }
+          log(`共享记忆：新增跨会话事实（${key || 'operator'}）${fact.text.slice(0, 40)}`);
+          appendActivity(`${key || 'operator'} [shared] 记下跨会话事实：${fact.text.slice(0, 60)}`);
+          sendJson({ ok: true, fact, stats: sharedMemory.stats() });
+          return;
+        }
+
         if (req.method === 'POST' && url.pathname === '/api/socialV2/memory-append') {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
@@ -10343,7 +10540,10 @@ async function main() {
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
     // 时间感放在 base 的最末尾：紧接着就是【唤醒】原因与行动指令，位置最显眼。
     const timeSenseLine = buildTimeSenseLine(st);
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + timeSenseLine;
+    // 跨会话共享记忆：只取**别的会话**的近况 + 跨会话事实，压成一小段联想线索。
+    const sharedText = sharedMemory.digest({ excludeKey: key });
+    const sharedLine = sharedText ? `${sharedText}\n\n` : '';
+    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + sharedLine + preSleepLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
@@ -10828,8 +11028,24 @@ async function main() {
     const resolveReply = (messageId) => resolveReplyInfo(kind, id, messageId, event.self_id);
     // textContent 带引用对象信息，供 DSH 判断“这句话在对谁说”；
     // plainContent 只保留当前消息自己的文字，用于命令/指向性判断，避免被引用原文干扰。
-    const textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
-    const plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false });
+    // 入站语音转写（socialV2.voice.transcribe.enabled 才生效；失败返回 null → [语音]）
+    const transcribeRecord = (seg) => transcribeInboundVoice({
+      cfg,
+      messageId: String(event.message_id ?? event.msg_id ?? ''),
+      file: seg?.data?.file ?? null,
+      log,
+    });
+    const textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply, transcribeRecord });
+    const plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false, transcribeRecord });
+    // 自动扫描：把会话里的消息落进跨会话共享记忆（群聊默认，私聊需显式开启）
+    try {
+      sharedMemory.recordObservation({
+        key,
+        sender: event?.sender?.card || event?.sender?.nickname || '',
+        userId: event?.user_id ?? null,
+        text: plainContent || textContent,
+      });
+    } catch { /* 共享记忆失败绝不影响正常收发 */ }
     const mediaList = extractMediaFromSegments(event.message ?? []);
     const messageRef = String(event.message_id ?? event.msg_id ?? event.message_seq ?? '');
     const seqRef = event.message_seq != null ? String(event.message_seq) : '';
@@ -11832,6 +12048,17 @@ async function main() {
   bot.onNotice('notify', async (event) => {
     try { await handlePokeNotice(event); } catch (error) { log('处理拍一拍事件出错:', error?.message ?? error); }
   });
+  // 入群自动授权：被 groupAutoAllow.inviters 里的人拉进群时，自动把该群加进白名单。
+  // OneBot 形状（SnowLuma 实测）：notice_type=group_increase、user_id=加入者（机器人自己时即 self_id）、
+  // operator_id=邀请人。不信任的邀请人只记日志，不授权——群聊一开就是把人放进不可控现场。
+  bot.onNotice('group_increase', async (event) => {
+    try { await handleGroupJoinNotice(event); } catch (error) { log('处理入群通知出错:', error?.message ?? error); }
+  });
+  // 对称处理：自己被踢/退群/群解散时把该群从白名单移除。
+  // 不做的话会留下「陈旧白名单」——群里一旦白过，之后哪怕被人随便再拉回去也直接放行。
+  bot.onNotice('group_decrease', async (event) => {
+    try { await handleGroupLeaveNotice(event); } catch (error) { log('处理退群通知出错:', error?.message ?? error); }
+  });
 
   // ── 上游健康：任何事件包都算「SnowLuma 还活着」，心跳还额外带接收链路健康度 ──
   // 用 onEvent 挂一个**旁路**订阅（不影响主链路）：
@@ -11885,6 +12112,8 @@ async function main() {
     // 「已连接」只说明与 SnowLuma 的 WebSocket 通了，**不说明 QQ 侧收得到消息** ——
     // 这个区别见 startSnowlumaWatch 的说明。这里顺手把上游健康快照刷一次。
     void pollSnowlumaStatus();
+    // 连上后扫一次「已在但未授权」的群（每进程一次；失败留待下次重连再试）
+    setTimeout(() => { void scanUngrantedGroups(); }, 5000);
     // 读取机器人昵称（用于社交模式"被提到"识别）；重连后也会刷新
     bot.getLoginInfo().then((login) => {
       if (login?.nickname) {

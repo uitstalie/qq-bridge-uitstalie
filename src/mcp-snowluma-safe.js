@@ -326,6 +326,8 @@ const TOOL_CONFIG_FLAGS = {
   qq_memory_query: 'memory',
   qq_memory_remove: 'memory',
   qq_memory_clear: 'memory',
+  qq_shared_recall: 'sharedMemory',
+  qq_shared_remember: 'sharedMemory',
   qq_slang_query: 'slangQuery',
   qq_slang_submit: 'slangSubmit',
   qq_send_voice: 'sendVoice',
@@ -949,6 +951,51 @@ server.tool(
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `记忆读取失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_shared_recall',
+  '检索跨会话共享记忆：别的群/私聊最近在聊什么，以及之前记下的跨会话事实。用来把一个会话的梗、近况、人物关系带到另一个会话里联想；只当线索用，别直接对群里说"A 群刚才在聊…"。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    query: z.string().optional().describe('检索词；留空返回最近的'),
+    limit: z.number().optional().describe('最多返回几条，默认 8')
+  },
+  async ({ key, token, query, limit }) => {
+    try {
+      const q = new URLSearchParams({ key });
+      if (query) q.set('q', query);
+      if (limit) q.set('limit', String(limit));
+      const data = await agentApi(`/api/socialV2/shared-memory?${q.toString()}`, { headers: { 'x-agent-token': token } });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `共享记忆读取失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_shared_remember',
+  '记下一条跨会话事实（所有会话可见，会出现在后续唤醒的【跨会话共享记忆】里）。适合记群内稳定设定、梗、人物关系、称呼习惯；不要记一次性闲聊。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    text: z.string().describe('要记的事实，一句话，≤240 字'),
+    tags: z.array(z.string()).optional().describe('可选标签，如 ["梗","称呼"]')
+  },
+  async ({ key, token, text, tags }) => {
+    try {
+      const data = await agentApi('/api/socialV2/shared-memory', {
+        method: 'POST',
+        headers: { 'x-agent-token': token },
+        body: JSON.stringify({ key, text, tags: tags ?? [] })
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `共享记忆写入失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );

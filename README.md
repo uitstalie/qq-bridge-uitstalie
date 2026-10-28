@@ -136,6 +136,8 @@ npm install        # 安装依赖（postinstall 会自动修补 @snowluma/sdk �
 | `workspaceTitle` | QQ 会话在 DSH 界面中的归组名称，默认「QQ 聊天」 |
 | `allow.private` / `allow.groups` | 白名单（QQ 号/群号数组）；留空且 `allowAllWhenEmpty: true` 时放行全部 |
 | `deny.*` | 黑名单，优先于白名单 |
+| `groupAutoAllow.inviters` | 信任的邀请人 QQ 数组。被其中任一账号**拉进新群**时，自动把该群加进 `allow.groups`（写回 `config.json`，运行时热生效）；自己被踢/退群/群解散时自动移除，避免陈旧白名单。留空=关闭，任何新群都需手动加白 |
+| `sharedMemory` | 跨会话共享记忆（memory/联想层）：每条入站消息自动落一条观察（`maxObservations`，默认只收群聊 `includePrivate:false`），模型可用 `qq_shared_remember` 记跨会话事实、`qq_shared_recall` 检索；唤醒时把**别的会话**的近况 + 事实压成 ≤`digestMaxChars` 字注入（`injectInPrompt`），窗口 `digestWindowMinutes` |
 | `ackMessage` | 消息投递后的立即回复，空字符串关闭 |
 | `sendDelayMs` | QQ 连续发送间隔，防止触发频率限制 |
 | `consolePort` | 本地控制台端口，默认 `3100` |
