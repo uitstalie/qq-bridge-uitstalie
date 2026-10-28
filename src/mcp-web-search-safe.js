@@ -53,7 +53,7 @@ const server = new McpServer({ name: 'web-search-safe', version: '0.2.1-r1' });
 
 server.tool(
   'web_search',
-  '只读联网搜索：优先使用与 DSH 相同的 DeepSeek 联网搜索（结果更准、不把群里的词发给搜索引擎广告网络），不可用时自动回退 Bing。返回标题/URL/摘要，不执行任何本地操作。适合查网络用语、梗、事实性问题和热点。用它查过资料再回答时，请在回复里带上 1~2 个可读来源（站点名优先，必要时短域），不要编造没返回过的域名。',
+  '只读联网搜索：优先使用与 DSH 相同的 DeepSeek 联网搜索（结果更准、不把群里的词发给搜索引擎广告网络），不可用时自动回退 Bing。返回标题/URL/摘要，不执行任何本地操作。适合查网络用语、梗、事实性问题和热点。用它查过资料再回答时，请**直接贴 1~2 条原始链接**（去掉追踪参数的干净 URL，不要只说站点名，不要用 markdown 链接语法），不要编造没返回过的链接。',
   { query: z.string().describe('要搜索确认的网络用语/黑话/梗/事实性问题') },
   async ({ query }) => {
     const clean = sanitizeQuery(query);
