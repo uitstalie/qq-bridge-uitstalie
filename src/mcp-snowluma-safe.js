@@ -326,6 +326,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_memory_query: 'memory',
   qq_memory_remove: 'memory',
   qq_memory_clear: 'memory',
+  qq_persona_state: 'personaState',
   qq_shared_recall: 'sharedMemory',
   qq_shared_remember: 'sharedMemory',
   qq_slang_query: 'slangQuery',
@@ -951,6 +952,35 @@ server.tool(
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `记忆读取失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_persona_state',
+  '查看/调整你对某个人的好感度等人格状态（数值由桥接持久化并夹在范围内）。只给 key + userId 是查看；再给 id + delta（或 value）和 reason 是调整。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    userId: z.string().describe('要查看/调整的群友 QQ 号（唤醒提示的【人格状态】里那个人）'),
+    id: z.string().optional().describe('状态变量 id，例如 affinity'),
+    delta: z.number().optional().describe('增量，例如 +5 / -10（桥接会夹到步进上限内）'),
+    value: z.number().optional().describe('直接设为某个值（仅管理端/纠偏用，优先于 delta）'),
+    reason: z.string().optional().describe('一句话理由，会记进最近一次变更')
+  },
+  async ({ key, token, userId, id, delta, value, reason }) => {
+    try {
+      const isWrite = Boolean(id) && (delta !== undefined || value !== undefined);
+      const data = isWrite
+        ? await agentApi('/api/socialV2/persona-state', {
+          method: 'POST',
+          headers: { 'x-agent-token': token },
+          body: JSON.stringify({ key, userId, id, delta, value, reason })
+        })
+        : await agentApi(`/api/socialV2/persona-state?${new URLSearchParams({ key, userId }).toString()}`, { headers: { 'x-agent-token': token } });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `人格状态操作失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );

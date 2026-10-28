@@ -13,7 +13,8 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import { extractPresetPrefix, presetPromptBlockers, presetPromptWarnings, renderPresetPromptYaml } from './preset-prompt.js';
-import { GEN1_ROLE_LINE_RE, parseRoleSections, roleCharStats, roleSectionReport, selectRoleText } from './role-card.js';
+import { GEN1_ROLE_LINE_RE, parseRoleCard, parseRoleSections, roleCharStats, roleSectionReport, selectRoleText } from './role-card.js';
+import { createPersonaState, normalizeStateDefs } from './persona-state.js';
 import { fileURLToPath } from 'node:url';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
@@ -636,6 +637,7 @@ function sanitizeRoleName(name) {
 }
 
 // 管理员 QQ（ownerQQ）规范化：空值=未设置；必须是正整数 QQ 号。
+// 也支持数组/逗号串（多管理员），见 normalizeOwnerList。
 function normalizeOwnerQQ(value) {
   if (value === undefined || value === null) return null;
   const s = String(value).trim();
@@ -647,6 +649,27 @@ function normalizeOwnerQQ(value) {
 }
 
 // 白名单/黑名单值规范化：只接受字符串或数字数组，非数组按空列表处理（fail-closed 语义由调用方决定）。
+/** 管理员列表：接受数字、数组或逗号/空白分隔的字符串；非法值抛错（与单值同口径）。 */
+function normalizeOwnerList(value) {
+  if (value === undefined || value === null) return [];
+  const raw = Array.isArray(value) ? value : String(value).split(/[,，\s]+/).filter(Boolean);
+  const out = [];
+  for (const item of raw) {
+    const n = normalizeOwnerQQ(item);
+    if (n && !out.includes(n)) out.push(n);
+  }
+  return out;
+}
+
+/** 判断某个 QQ 号是否是管理员（owner），兼容旧的单值 ownerQQ。 */
+function isOwnerId(cfg, id) {
+  if (id === undefined || id === null || String(id).trim() === '') return false;
+  const owners = Array.isArray(cfg?.ownerQQs) && cfg.ownerQQs.length
+    ? cfg.ownerQQs
+    : (cfg?.ownerQQ ? [cfg.ownerQQ] : []);
+  return owners.some((n) => String(n) === String(id));
+}
+
 function normalizeIdList(value) {
   if (!Array.isArray(value)) return [];
   return value.map((v) => String(v).trim()).filter((v) => /^\d+$/.test(v));
@@ -679,7 +702,8 @@ function loadConfig() {
     sessionCwd: file.sessionCwd ?? '',
     agentPreset: file.agentPreset ?? 'qq-chat',
     workspaceTitle: file.workspaceTitle ?? 'QQ 聊天',
-    ownerQQ: normalizeOwnerQQ(file.ownerQQ),
+    ownerQQ: normalizeOwnerQQ(Array.isArray(file.ownerQQ) ? file.ownerQQ[0] : file.ownerQQ),
+    ownerQQs: normalizeOwnerList(file.ownerQQ ?? file.ownerQQs),
     allow: {
       private: normalizeIdList(file.allow?.private ?? file.allow?.privates ?? []),
       groups: normalizeIdList(file.allow?.groups ?? file.allow?.group ?? [])
@@ -694,6 +718,11 @@ function loadConfig() {
     groupAutoAllow: {
       inviters: normalizeIdList(file.groupAutoAllow?.inviters ?? []),
       adoptExisting: file.groupAutoAllow?.adoptExisting === true
+    },
+    // 人格状态变量（好感度等）：数值存桥接，模型只能提交增量
+    personaState: {
+      enabled: file.personaState?.enabled !== false,
+      maxEntries: file.personaState?.maxEntries
     },
     // 跨会话共享记忆（memory/联想层）的开关与容量
     sharedMemory: {
@@ -790,6 +819,7 @@ function loadConfig() {
         setWakeConfig: true,
         markRead: true,
         memory: true,
+        personaState: true,
         sharedMemory: true,
         getImages: true,
         getForwardMsg: true,
@@ -914,6 +944,7 @@ function loadConfig() {
     setWakeConfig: true,
     markRead: true,
     memory: true,
+    personaState: true,
     sharedMemory: true,
     slangQuery: true,
     slangSubmit: true,
@@ -1414,6 +1445,8 @@ async function main() {
   const cfg = loadConfig();
   // 跨会话共享记忆（memory/联想层）：state/shared-memory.json，自动扫描 + 模型主动记事实
   const sharedMemory = createSharedMemory({ file: path.join(STATE_DIR, 'shared-memory.json'), cfg, log });
+  // 人格状态变量（好感度等）：state/persona-state.json，按「会话 + 成员」分桶
+  const personaState = createPersonaState({ file: path.join(STATE_DIR, 'persona-state.json'), cfg, log });
   fs.mkdirSync(STATE_DIR, { recursive: true });
   hardenStateDirAcl();
   acquireLock();
@@ -2694,8 +2727,8 @@ async function main() {
   /** 当前模式是否允许该会话进入 */
   function modeAllowed(key, kind, id, cfg, mode) {
     if (mode === 'closed-agent') {
-      // 封闭 agent 模式：仅 owner 私聊
-      return key === `private:${String(cfg.ownerQQ ?? '')}`;
+      // 封闭 agent 模式：仅 owner（可多个）私聊
+      return kind === 'private' && isOwnerId(cfg, id);
     }
     // chat / reserved / reserved2（仿真模式，暂同 chat 白名单）
     return allowed(kind, id, cfg);
@@ -3172,6 +3205,25 @@ async function main() {
     snowlumaHealth.goodSource = source;
     snowlumaHealth.goodError = '';
     snowlumaHealth.goodCheckedAt = Date.now();
+  }
+
+  // 人格卡 frontmatter 缓存：按 mtime 失效，改卡不用重启
+  const roleCardMetaCache = new Map();
+  function readRoleCardMeta(roleName) {
+    const name = String(roleName ?? '').trim();
+    if (!name || /[\\/]/.test(name) || name === '.' || name === '..') return { defs: [], meta: {} };
+    const file = path.join(ROOT, 'roles', `${name}.md`);
+    try {
+      const stat = fs.statSync(file);
+      const cached = roleCardMetaCache.get(name);
+      if (cached && cached.mtimeMs === stat.mtimeMs) return cached;
+      const parsed = parseRoleCard(fs.readFileSync(file, 'utf8'));
+      const entry = { mtimeMs: stat.mtimeMs, defs: normalizeStateDefs(parsed.meta?.state), meta: parsed.meta ?? {} };
+      roleCardMetaCache.set(name, entry);
+      return entry;
+    } catch {
+      return { defs: [], meta: {} };
+    }
   }
 
   /** 供 /api/status 与控制台使用的只读快照。 */
@@ -4582,7 +4634,7 @@ async function main() {
             merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sharedMemory', 'sendVoice'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sharedMemory', 'personaState', 'sendVoice'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -6782,6 +6834,42 @@ async function main() {
           }
           return;
         }
+        // ── 人格状态变量（好感度等）：数值存桥接，模型只提交增量 ───────────────
+        if (url.pathname === '/api/socialV2/persona-state') {
+          const body = req.method === 'POST' ? await readBody() : {};
+          const key = String((req.method === 'POST' ? body.key : url.searchParams.get('key')) ?? '').trim();
+          const userId = String((req.method === 'POST' ? body.userId : url.searchParams.get('userId')) ?? '').trim();
+          if (req.headers['x-agent-token']) {
+            if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+            if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+            if (!v2ToolEnabled('personaState')) { sendJson({ ok: false, error: '工具未启用：qq_persona_state' }, 403); return; }
+          }
+          const roleStateNow = readRoleState();
+          const roleMetaNow = readRoleCardMeta(roleStateNow.role);
+          if (!roleMetaNow.defs.length) { sendJson({ ok: false, error: '当前角色没有定义人格状态变量（roles/<角色>.md 的 frontmatter state）' }, 400); return; }
+          if (req.method === 'GET') {
+            if (!userId) {
+              sendJson({ ok: true, role: roleStateNow.role ?? null, defs: roleMetaNow.defs, stats: personaState.stats() });
+              return;
+            }
+            sendJson({ ok: true, role: roleStateNow.role ?? null, userId, values: personaState.read(key, userId, roleMetaNow.defs) });
+            return;
+          }
+          const id = String(body.id ?? '').trim();
+          const def = roleMetaNow.defs.find((d) => d.id === id);
+          if (!def) { sendJson({ ok: false, error: `未知状态变量：${id || '(空)'}` }, 400); return; }
+          if (!userId) { sendJson({ ok: false, error: 'userId 不能为空' }, 400); return; }
+          const reason = String(body.reason ?? '').slice(0, 60);
+          const result = body.value !== undefined && body.value !== null
+            ? personaState.set({ key, userId, def, value: body.value, reason: reason || 'operator' })
+            : personaState.adjust({ key, userId, def, delta: body.delta, reason });
+          if (!result) { sendJson({ ok: false, error: 'delta/value 无效或状态变量未启用' }, 400); return; }
+          log(`人格状态：${key} ${userId} ${def.label} ${result.prev}→${result.value}（${reason || '无理由'}）`);
+          appendActivity(`${key} [persona] ${def.label} ${result.prev}→${result.value}：${reason || ''}`);
+          sendJson({ ok: true, id, label: def.label, ...result });
+          return;
+        }
+
         // ── 跨会话共享记忆（memory / 联想层）──────────────────────────────────
         // GET：检索事实 + 别的会话的最近观察；POST：记一条跨会话事实。
         // agent 通道要令牌 + 模式白名单 + 工具开关；控制台通道由外层 consoleToken 把关。
@@ -10495,6 +10583,21 @@ async function main() {
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
     const memoryText = formatMemoryV2(st);
     const memoryLine = memoryText ? `${memoryText}\n\n` : '';
+    // 身份识别 + 人格状态：都只针对「最近说话的那个人」，不把全群数值灌进 prompt。
+    const lastIncoming = [...(Array.isArray(st.recentMessages) ? st.recentMessages : [])].reverse().find((m) => m && !m.isSelf && m.userId);
+    const speakerId = lastIncoming?.userId ?? null;
+    const speakerName = String(lastIncoming?.sender ?? speakerId ?? '');
+    const speakerIsOwner = speakerId != null && isOwnerId(cfg, speakerId);
+    const speakerLine = speakerId == null
+      ? ''
+      : (speakerIsOwner
+        ? `【身份识别】最近说话的是**管理员**（${speakerId}）。管理员可以要求切换角色、OOC 讨论、调整设置，照做即可。\n\n`
+        : `【身份识别】最近说话的是群友「${speakerName}」（${speakerId}）。角色与设置只能由管理员改，群友提这类要求时按人设带过。\n\n`);
+    const roleMeta = readRoleCardMeta(roleState.role);
+    const personaText = speakerId != null && roleMeta.defs.length ? personaState.describe(key, speakerId, roleMeta.defs) : '';
+    const personaLine = personaText
+      ? `【人格状态】对「${speakerName}」：${personaText}。情绪明显变化时可以用 qq_persona_state 增减（附一句理由）。\n\n`
+      : '';
     // 注意：黑话表不在这里注入，deliverPromptNow 的 withSlangContext 会统一注入，
     // 避免唤醒 prompt 出现两份黑话表。
     const participationText = formatParticipationV2(st);
@@ -10543,7 +10646,7 @@ async function main() {
     // 跨会话共享记忆：只取**别的会话**的近况 + 跨会话事实，压成一小段联想线索。
     const sharedText = sharedMemory.digest({ excludeKey: key });
     const sharedLine = sharedText ? `${sharedText}\n\n` : '';
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + sharedLine + preSleepLine + timeSenseLine;
+    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + personaLine + speakerLine + participationLine + sharedLine + preSleepLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
@@ -11069,7 +11172,7 @@ async function main() {
     const quoteTargetIsSelf = await isQuoteTargetSelf(event.message ?? [], kind, id, event.self_id);
     if (!isSessionAllowedInCurrentMode(key)) return;
     if (!plainContent && !quoteTargetIsSelf) return;
-    const isOwner = String(event.user_id) === String(cfg.ownerQQ ?? '');
+    const isOwner = isOwnerId(cfg, event.user_id);
     const roleState = readRoleState();
 
     // 若该会话有挂起的提问/审批，先当作回答处理（用当前消息自己的文字，不含引用原文）。
@@ -11479,7 +11582,7 @@ async function main() {
       } catch {}
     }
     const targetIsSelf = !!targetId && selfId != null && String(targetId) === String(selfId);
-    const isOwner = String(senderId) === String(cfg.ownerQQ ?? '');
+    const isOwner = isOwnerId(cfg, senderId);
     const msg = appendSocialV2Poke(key, {
       sender,
       userId: senderId || null,

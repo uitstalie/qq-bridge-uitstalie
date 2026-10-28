@@ -136,7 +136,9 @@ npm install        # 安装依赖（postinstall 会自动修补 @snowluma/sdk �
 | `workspaceTitle` | QQ 会话在 DSH 界面中的归组名称，默认「QQ 聊天」 |
 | `allow.private` / `allow.groups` | 白名单（QQ 号/群号数组）；留空且 `allowAllWhenEmpty: true` 时放行全部 |
 | `deny.*` | 黑名单，优先于白名单 |
+| `ownerQQ` | 管理员 QQ：单个号或数组（多管理员）。决定谁能用管理命令、`closed-agent`、角色切换；唤醒提示里会标明「最近说话的是管理员」并允许其要求切换角色/OOC |
 | `groupAutoAllow.inviters` | 信任的邀请人 QQ 数组。被其中任一账号**拉进新群**时，自动把该群加进 `allow.groups`（写回 `config.json`，运行时热生效）；自己被踢/退群/群解散时自动移除，避免陈旧白名单。留空=关闭，任何新群都需手动加白 |
+| `personaState` | 人格状态变量（好感度等）的持久化开关：数值存 `state/persona-state.json`（按「会话+成员」分桶），唤醒时注入【人格状态】；模型只能通过 `qq_persona_state` 提交增量（桥接夹取范围并留痕）。变量定义写在 `roles/<角色>.md` 的 frontmatter `state:` 段 |
 | `sharedMemory` | 跨会话共享记忆（memory/联想层）：每条入站消息自动落一条观察（`maxObservations`，默认只收群聊 `includePrivate:false`），模型可用 `qq_shared_remember` 记跨会话事实、`qq_shared_recall` 检索；唤醒时把**别的会话**的近况 + 事实压成 ≤`digestMaxChars` 字注入（`injectInPrompt`），窗口 `digestWindowMinutes` |
 | `ackMessage` | 消息投递后的立即回复，空字符串关闭 |
 | `sendDelayMs` | QQ 连续发送间隔，防止触发频率限制 |

@@ -11,6 +11,8 @@
 //   ## 分条方式 〔一代〕        → 只在 reserved/chat 注入
 //   ## 你是谁                   → 两种模式都注入
 // 标记会在注入前从标题里去掉，模型看到的始终是干净的小节标题。
+import yaml from 'js-yaml';
+
 export const ROLE_INJECT_MODES = ['v1', 'v2'];
 
 // 模式标记：`〔二代〕` / `[v2]` / `（reserved2）` 等写法都认。
@@ -106,3 +108,25 @@ export function roleCharStats(text) {
 // 一代仿真遗留指令：未加模式标记时，这些行在二代下会被兜底过滤。
 // 正确做法是给所在小节加上 〔一代〕 标记。
 export const GEN1_ROLE_LINE_RE = /\[SILENT\]|空格分隔|按空格|用空格|空格分句|空格代表|自动转发|回复会自动|输出\s*\[SILENT\]/i;
+
+/**
+ * 解析人格卡顶部的 YAML frontmatter：`---\n…\n---\n正文`。
+ *
+ * 为什么加它：正文是给人看的（`小鲸鱼.md` 那种质量远高于关键词堆砌），但「好感度」
+ * 这类状态变量需要机器可读——初始值/上下限/步进写进 frontmatter，正文只描述性格。
+ * 解析失败一律退回「无 frontmatter」：一张写得再花的人格卡也不该因为 YAML 打错而失效。
+ *
+ * @returns {{ meta: object, body: string }}
+ */
+export function parseRoleCard(text) {
+  const source = String(text ?? '');
+  const match = /^\uFEFF?---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(source);
+  if (!match) return { meta: {}, body: source };
+  try {
+    const meta = yaml.load(match[1]);
+    if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return { meta: {}, body: source };
+    return { meta, body: source.slice(match[0].length) };
+  } catch {
+    return { meta: {}, body: source };
+  }
+}

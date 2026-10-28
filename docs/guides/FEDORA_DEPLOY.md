@@ -174,6 +174,25 @@ WantedBy=default.target
 - [实测] `kill -9` 模拟崩溃 → 5 秒后自动拉起（PID 变化、`SnowLuma 已连接` 重连成功）。
 - 日志：`journalctl --user -u qq-bridge -f`；桥接自己也写 `state/bridge.log` 与 `state/qq-activity.log`。
 
+#### 为什么 SnowLuma / QQ 要用 `at` 启动（cgroup 陷阱，2026-10-28 实测）
+
+DSH 的每个工具调用都跑在 `dsh-subprocess-<pid>-<hash>.scope` 里。从这个 shell 起的进程**即使 `setsid`** 也还在同一个 cgroup —— DSH 一重启，systemd 把整个 scope 的 cgroup 杀掉，SnowLuma 和 QQ 会同时收到 SIGTERM（实测 23:36:40 两者一起死，桥接随之断线到 23:41）。
+
+`setsid` 只脱离会话/终端，**不脱离 cgroup**。要真正活过 DSH 重启，得用别的东西托管：
+
+```bash
+# SnowLuma（无 GUI 依赖，atd 托管）
+echo 'cd /home/uitstalie/apps && exec ./launcher.sh >> /home/uitstalie/apps/snowluma.log 2>&1' | at now
+
+# QQ（需要图形会话的环境变量）
+cat <<'EOF' | at now
+export WAYLAND_DISPLAY=wayland-0 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus XDG_SESSION_TYPE=wayland
+exec /opt/QQ/qq >> /home/uitstalie/apps/qq.log 2>&1
+EOF
+```
+
+（`atd` 是系统服务，父 cgroup 不在 DSH 里；从 konsole 手动起也一样安全。用 `systemd-run --user --unit=...` 的 transient unit 也行，但那算 systemd 托管，按 L6/EULA 留给 SnowLuma 不合适。）
+
 #### 待机与唤醒（2026-10-28）
 
 - 待机会**冻结整机**：网络断开、消息进不来，「靠 QQ 消息唤醒」不成立——睡下去只能等人回来按电源（或 WoL / RTC 定时，二者都要额外配置）。

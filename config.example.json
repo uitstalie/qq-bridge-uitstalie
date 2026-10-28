@@ -33,6 +33,10 @@
     "inviters": [],
     "adoptExisting": false
   },
+  "personaState": {
+    "enabled": true,
+    "maxEntries": 500
+  },
   "sharedMemory": {
     "enabled": true,
     "includePrivate": false,
