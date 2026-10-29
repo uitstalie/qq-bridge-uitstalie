@@ -9075,6 +9075,26 @@ async function main() {
     return `【参与度参考】你最近 1 小时发言 ${aiCount} 次，群友发言 ${otherCount} 条${burstText}。${hint}`;
   }
 
+  // 对刷检测：最近一小段里如果只有「你」和「同一个人」在来回、没有第三个人插话，
+  // 很可能是在跟另一个 AI / 一个只跟机器人聊的人互刷 token。这里只做提示，不硬拦——
+  // 硬拦容易误伤（真正的私聊式闲聊），提示让模型自己收手。
+  function loopWarningLineV2(st) {
+    const recent = Array.isArray(st?.recentMessages) ? st.recentMessages : [];
+    const tail = recent.slice(-8).filter((m) => m && typeof m === 'object');
+    if (tail.length < 6) return '';
+    let selfCount = 0;
+    const perSender = new Map();
+    for (const m of tail) {
+      if (m.isSelf) { selfCount += 1; continue; }
+      const who = String(m.sender || '').trim() || '(未知)';
+      perSender.set(who, (perSender.get(who) || 0) + 1);
+    }
+    if (perSender.size !== 1) return '';
+    const [who, count] = [...perSender.entries()][0];
+    if (count < 3 || selfCount < 3) return '';
+    return `【对刷警告】最近 ${tail.length} 条只有你和「${who}」在来回（你 ${selfCount} 条 / 对方 ${count} 条），没有第三个人插话——很像 AI 互刷或一对一对聊。这轮最多回一句，或者干脆不回、收尾，别继续往返烧 token。\n\n`;
+  }
+
   function suggestQuietMsV2(st) {
     const defaultMs = Number(cfg.socialV2?.wait?.defaultQuietMs) || 8000;
     if (!st) return defaultMs;
@@ -10605,6 +10625,7 @@ async function main() {
     const personaLine = personaText
       ? `【人格状态】对「${speakerName}」：${personaText}。情绪明显变化时可以用 qq_persona_state 增减（附一句理由）。\n\n`
       : '';
+    const loopLine = loopWarningLineV2(st);
     // 注意：黑话表不在这里注入，deliverPromptNow 的 withSlangContext 会统一注入，
     // 避免唤醒 prompt 出现两份黑话表。
     const participationText = formatParticipationV2(st);
@@ -10653,7 +10674,7 @@ async function main() {
     // 跨会话共享记忆：只取**别的会话**的近况 + 跨会话事实，压成一小段联想线索。
     const sharedText = sharedMemory.digest({ excludeKey: key });
     const sharedLine = sharedText ? `${sharedText}\n\n` : '';
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + personaLine + speakerLine + participationLine + sharedLine + preSleepLine + timeSenseLine;
+    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + personaLine + speakerLine + loopLine + participationLine + sharedLine + preSleepLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
