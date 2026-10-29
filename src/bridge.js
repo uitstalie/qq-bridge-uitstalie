@@ -6900,6 +6900,15 @@ async function main() {
           sendJson({ ok: true, ...found, stats: sharedMemory.stats() });
           return;
         }
+        if (req.method === 'DELETE' && url.pathname === '/api/socialV2/shared-memory') {
+          const body = await readBody();
+          const text = String(body.text ?? '').trim();
+          if (!text) { sendJson({ ok: false, error: 'text 不能为空' }, 400); return; }
+          const removed = sharedMemory.forget({ text });
+          if (removed > 0) { log(`共享记忆：删除跨会话事实 ${removed} 条（${text.slice(0, 30)}）`); appendActivity(`[shared] 删除跨会话事实 ${removed} 条`); }
+          sendJson({ ok: true, removed, stats: sharedMemory.stats() });
+          return;
+        }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/shared-memory') {
           const body = await readBody();
           const key = String(body.key ?? '').trim();

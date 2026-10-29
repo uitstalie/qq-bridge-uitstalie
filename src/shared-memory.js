@@ -148,6 +148,18 @@ export function createSharedMemory({ file, cfg, log = null }) {
     return entry;
   };
 
+  /** 删除跨会话事实：按包含匹配（用于纠错）。返回删除条数。 */
+  const forget = ({ text = '' } = {}) => {
+    const q = normalizeText(text).slice(0, 240);
+    if (!q) return 0;
+    load();
+    const before = data.facts.length;
+    data.facts = data.facts.filter((f) => !String(f.text ?? '').includes(q));
+    const removed = before - data.facts.length;
+    if (removed > 0) scheduleFlush();
+    return removed;
+  };
+
   /** 轻量检索：事实 + 观察的包含匹配，按时间倒序。 */
   const recall = ({ query = '', limit = 8 } = {}) => {
     load();
@@ -213,5 +225,5 @@ export function createSharedMemory({ file, cfg, log = null }) {
     return { observations: data.observations.length, facts: data.facts.length, file, lastLoadAt };
   };
 
-  return { recordObservation, remember, recall, digest, stats, flush };
+  return { recordObservation, remember, forget, recall, digest, stats, flush };
 }
