@@ -662,6 +662,14 @@ function normalizeOwnerList(value) {
 }
 
 /** 判断某个 QQ 号是否是管理员（owner），兼容旧的单值 ownerQQ。 */
+// 疑似 AI 的账号（其它机器人/LLM 马甲）：不参与唤醒决策，也不主动搭话。
+// 名单在 config.json 的 socialV2.aiSenders 里维护（QQ 号数组）。
+function isAiSender(cfg, id) {
+  if (id === undefined || id === null || String(id).trim() === '') return false;
+  const list = Array.isArray(cfg?.socialV2?.aiSenders) ? cfg.socialV2.aiSenders : [];
+  return list.some((n) => String(n) === String(id));
+}
+
 function isOwnerId(cfg, id) {
   if (id === undefined || id === null || String(id).trim() === '') return false;
   const owners = Array.isArray(cfg?.ownerQQs) && cfg.ownerQQs.length
@@ -10553,7 +10561,9 @@ async function main() {
     };
     const tryAdd = (field, msg) => {
       const previousThrough = packet.readThroughSeq;
-      packet[field].push(compactModelMessage(msg, { now }));
+      const compacted = compactModelMessage(msg, { now });
+      if (isAiSender(cfg, msg.userId)) compacted.suspectedAi = true;
+      packet[field].push(compacted);
       packet.includedUnreadCount = packet.messages.length;
       packet.readThroughSeq = readThroughSeqV2(st, [...packet.messages, ...packet.recent]);
       packet.partial = packet.messages.length < st.unread.length;
@@ -11334,6 +11344,12 @@ async function main() {
         saveSocialV2State();
         scheduleWakeV2(key, 'bootstrap');
       } else {
+        if (isAiSender(cfg, event.user_id)) {
+          // 疑似 AI 的账号发言：只入库（供人说话时做上下文），不参与唤醒决策，
+          // 避免两个机器人你来我往地互刷 token。
+          appendActivity(`${key} [reserved2] 疑似 AI 发言，跳过唤醒：${textContent.slice(0, 60)}`);
+          return;
+        }
         const reason = evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf);
         if (reason) {
           scheduleWakeV2(key, reason);
