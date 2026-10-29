@@ -9082,9 +9082,9 @@ async function main() {
     const last = [...recent].reverse().find((m) => m && !m.isSelf);
     if (!last) return defaultMs;
     const text = String(last.tail || last.plain || last.text || '').trim();
-    if (looksLikeUnfinished(text)) return 12000;
+    if (looksLikeUnfinished(text)) return 8000;
     const burst = recent.filter((m) => m && !m.isSelf && Date.now() - Number(m.time || 0) < 15000).length;
-    if (burst >= 3) return 12000;
+    if (burst >= 3) return 8000;
     return defaultMs;
   }
 

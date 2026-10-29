@@ -65,3 +65,5 @@
                   thresholdChars: 50000
                   headChars: 45000
                   tailChars: 2000
+              - id: image-offload
+                name: '@deepseek-ai/dsh-compaction-image-offload'

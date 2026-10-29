@@ -193,3 +193,8 @@
         thresholdChars: 50000
         headChars: 45000
         tailChars: 2000
+
+    # 图片预算：路由因「图片过多/超预算」拒绝请求时，把最老的图片替换成占位文本并重试。
+    # 之前没挂这个：2026-10-29 牢洛的会话累积 19 张历史图片，请求被顶成 400 INVALID_REQUEST。
+    - id: image-offload
+      name: '@deepseek-ai/dsh-compaction-image-offload'
