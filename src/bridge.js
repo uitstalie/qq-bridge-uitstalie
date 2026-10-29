@@ -1436,6 +1436,7 @@ function canonicalV2Key(key) {
 // 错误通知节流：同一个会话连续出错时，别每 30 秒往群里发一条「⚠️ agent 处理出错」——
 // 实测 13 分钟发 21 条，直接把 QQ 风控触发成 result=120（消息发不出去）。
 const lastAgentErrorNoticeAt = new Map();
+const contextRebuildAt = new Map();
 
 const APPROVE_WORDS = new Set(['通过', '同意', '允许', '批准', 'yes', 'y', 'approve', 'ok']);
 const REJECT_WORDS = new Set(['拒绝', '不同意', '不允许', '驳回', 'no', 'n', 'reject', 'deny']);
@@ -12021,6 +12022,24 @@ async function main() {
                 // 以前这里只发 QQ、不写日志：出问题时 bridge.log 里什么都没有，排查只能靠猜（PR #24）。
                 log(`⚠️ agent 处理出错 (${key})：${safeMsg}`);
                 appendActivity(`${key} agent 处理出错：${safeMsg.slice(0, 80)}`);
+                // 上下文被模型端拒绝（400 INVALID_REQUEST，典型是历史/图片累积过大）：
+                // 归档重建而不是干等——退役该会话，下一条消息会用新会话重新开始；
+                // 10 分钟内只重建一次，避免失败时连环退役。
+                if (/INVALID_REQUEST|request failed \(400\)/i.test(safeMsg)) {
+                  const lastRebuild = contextRebuildAt.get(key) ?? 0;
+                  if (Date.now() - lastRebuild >= 600000) {
+                    contextRebuildAt.set(key, Date.now());
+                    try {
+                      retireSession(key);
+                      log(`🧹 上下文重建：已退役 ${key} 的会话，下一条消息会重新建会话`);
+                      appendActivity(`${key} 上下文重建（400 INVALID_REQUEST）`);
+                    } catch (error) {
+                      log(`上下文重建失败 ${key}: ${error?.message ?? error}`);
+                    }
+                  } else {
+                    log(`（上下文重建已在 10 分钟内做过，本次只记录不重建）`);
+                  }
+                }
                 // 节流：同一会话默认 10 分钟内只发一条错误通知（连续 400 时不再刷屏触发风控）
                 const noticeGapMs = Math.max(60000, Number(cfg.socialV2?.errorNotice?.minIntervalMs) || 600000);
                 const lastNoticeAt = lastAgentErrorNoticeAt.get(key) ?? 0;
