@@ -291,7 +291,8 @@
       "gifFrames": 6,
       "gifTile": 240,
       "normalizeTimeoutMs": 25000
-    }
+    },
+    "aiSenders": []
   },
   "webSearch": {
     "provider": "auto",
